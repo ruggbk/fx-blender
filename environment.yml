@@ -1,0 +1,11 @@
+name: fx-blender
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - pedalboard
+    - numpy
+    - matplotlib
+    - ipykernel
