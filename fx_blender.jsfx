@@ -1,0 +1,255 @@
+desc:fx-blender — Multiband A/B Frequency Blend
+version:0.1
+author:ruggbk
+
+// 4-channel input: spl0/1 = chain A (L/R), spl2/3 = chain B (L/R)
+in_pin:A Left
+in_pin:A Right
+in_pin:B Left
+in_pin:B Right
+out_pin:Mix Left
+out_pin:Mix Right
+out_pin:Thru
+out_pin:Thru
+
+slider1:12<4,48,1>Semitones per Cycle
+slider2:1.0<0.0,1.0,0.01>Blend Strength
+slider3:0<0,2,1{Sine,Step,Linear}>Blend Shape
+slider4:0<0,1,1{Normal,Swap A-B}>Swap A/B
+slider5:82.0<20.0,500.0,1.0>Low Freq Hz
+slider6:5000.0<1000.0,20000.0,100.0>High Freq Hz
+
+@init
+
+WIN_SIZE = 512;     // real samples per window
+FFT_N    = 512;     // complex pairs for fft() — same as WIN_SIZE since we pack real+j0
+HOP_SIZE = 128;     // WIN_SIZE/4, 75% overlap
+
+// Buffer base offsets in EEL2 flat memory
+BUF_IN_AL  = 0;      // 512 words: input ring A-left
+BUF_IN_AR  = 512;    // 512 words: input ring A-right
+BUF_IN_BL  = 1024;   // 512 words: input ring B-left
+BUF_IN_BR  = 1536;   // 512 words: input ring B-right
+BUF_HANN   = 2048;   // 512 words: Hann window table
+BUF_FFT_AL = 2560;   // 1024 words: FFT work A-left  (512 complex pairs)
+BUF_FFT_AR = 3584;   // 1024 words: FFT work A-right
+BUF_FFT_BL = 4608;   // 1024 words: FFT work B-left
+BUF_FFT_BR = 5632;   // 1024 words: FFT work B-right
+BUF_BLEND  = 6656;   // 512 words:  blend value per bin
+BUF_OLA_L  = 7168;   // 512 words:  overlap-add accumulator left
+BUF_OLA_R  = 7680;   // 512 words:  overlap-add accumulator right
+// Total: 8192 words (~32 KB)
+
+memset(0, 0, 8192);
+
+// Build Hann window
+i = 0;
+loop(WIN_SIZE,
+  (BUF_HANN + i)[] = 0.5 * (1.0 - cos(2.0 * $pi * i / (WIN_SIZE - 1)));
+  i += 1;
+);
+
+// OLA normalization constant.
+// With Hann at analysis and synthesis, 75% overlap, sum of hann^2
+// across 4 active frames at any sample position ≈ 1.5.
+// ola_norm folds in both that factor and the IFFT scale (1/FFT_N).
+ola_norm_sum = 0;
+j = 0;
+loop(4,
+  h = (BUF_HANN + j * HOP_SIZE)[];
+  ola_norm_sum += h * h;
+  j += 1;
+);
+ola_norm = 1.0 / (ola_norm_sum * FFT_N);
+
+in_ptr    = 0;
+out_ptr   = 0;
+hop_count = 0;
+inv_log2  = 1.0 / log(2.0);
+
+// Report latency to Reaper for automatic PDC track alignment
+pdc_delay   = WIN_SIZE;
+pdc_bot_ch  = 0;
+pdc_top_ch  = 2;
+
+@slider
+
+semitones_per_cycle = max(slider1, 0.001);
+blend_strength      = slider2;
+blend_shape         = floor(slider3 + 0.5);   // round to nearest integer
+swap_ab             = slider4 > 0.5;
+f_lo                = max(slider5, 1.0);
+f_hi                = slider6;
+
+bin_hz = srate / WIN_SIZE;
+
+k = 0;
+loop(FFT_N,
+  f_k = k * bin_hz;
+  b   = 1.0;  // default: pass A for DC and out-of-range bins
+
+  (k > 0 && f_k >= f_lo && f_k <= f_hi) ? (
+    semitones = 12.0 * log(f_k / f_lo) * inv_log2;
+    phase     = 2.0 * $pi * semitones / semitones_per_cycle;
+    cp        = cos(phase);
+
+    blend_shape == 0 ? (
+      b = 0.5 + blend_strength * 0.5 * cp;
+    ) : blend_shape == 1 ? (
+      b = cp >= 0 ? 0.5 + blend_strength * 0.5 : 0.5 - blend_strength * 0.5;
+    ) : (
+      t = semitones % semitones_per_cycle;
+      t < 0 ? t += semitones_per_cycle;
+      t /= semitones_per_cycle;
+      b = 0.5 + blend_strength * 0.5 * (4.0 * abs(t - 0.5) - 1.0);
+    );
+
+    b = max(0.0, min(1.0, b));
+  );
+
+  swap_ab ? b = 1.0 - b;
+  (BUF_BLEND + k)[] = b;
+  k += 1;
+);
+
+BUF_BLEND[] = 1.0;  // DC bin always passes A
+
+@block
+// FFT processing is triggered per-sample from @sample
+
+@sample
+
+// Write new samples into ring buffers
+(BUF_IN_AL + in_ptr)[] = spl0;
+(BUF_IN_AR + in_ptr)[] = spl1;
+(BUF_IN_BL + in_ptr)[] = spl2;
+(BUF_IN_BR + in_ptr)[] = spl3;
+in_ptr += 1;
+in_ptr >= WIN_SIZE ? in_ptr = 0;
+hop_count += 1;
+
+// Read from OLA output buffer, clear the consumed slot
+spl0 = (BUF_OLA_L + out_ptr)[];
+spl1 = (BUF_OLA_R + out_ptr)[];
+(BUF_OLA_L + out_ptr)[] = 0;
+(BUF_OLA_R + out_ptr)[] = 0;
+out_ptr += 1;
+out_ptr >= WIN_SIZE ? out_ptr = 0;
+
+spl2 = 0;
+spl3 = 0;
+
+// Every HOP_SIZE samples, process a new STFT frame
+hop_count >= HOP_SIZE ? (
+  hop_count = 0;
+
+  // Unpack ring buffers into FFT work buffers (Hann-windowed, real+j0)
+  src = in_ptr;
+  k   = 0;
+  loop(WIN_SIZE,
+    w  = (BUF_HANN + k)[];
+    ki = k * 2;
+
+    (BUF_FFT_AL + ki)[]     = (BUF_IN_AL + src)[] * w;
+    (BUF_FFT_AL + ki + 1)[] = 0;
+    (BUF_FFT_AR + ki)[]     = (BUF_IN_AR + src)[] * w;
+    (BUF_FFT_AR + ki + 1)[] = 0;
+    (BUF_FFT_BL + ki)[]     = (BUF_IN_BL + src)[] * w;
+    (BUF_FFT_BL + ki + 1)[] = 0;
+    (BUF_FFT_BR + ki)[]     = (BUF_IN_BR + src)[] * w;
+    (BUF_FFT_BR + ki + 1)[] = 0;
+
+    src += 1;
+    src >= WIN_SIZE ? src = 0;
+    k   += 1;
+  );
+
+  // FFT all four channels (fft_permute must precede fft)
+  fft_permute(BUF_FFT_AL, FFT_N);  fft(BUF_FFT_AL, FFT_N);
+  fft_permute(BUF_FFT_AR, FFT_N);  fft(BUF_FFT_AR, FFT_N);
+  fft_permute(BUF_FFT_BL, FFT_N);  fft(BUF_FFT_BL, FFT_N);
+  fft_permute(BUF_FFT_BR, FFT_N);  fft(BUF_FFT_BR, FFT_N);
+
+  // Per-bin blend: output[f] = b*A[f] + (1-b)*B[f]
+  k = 0;
+  loop(FFT_N,
+    b  = (BUF_BLEND + k)[];
+    ob = 1.0 - b;
+    ki = k * 2;
+
+    al_re = (BUF_FFT_AL + ki)[];      al_im = (BUF_FFT_AL + ki + 1)[];
+    bl_re = (BUF_FFT_BL + ki)[];      bl_im = (BUF_FFT_BL + ki + 1)[];
+    (BUF_FFT_AL + ki)[]     = b * al_re + ob * bl_re;
+    (BUF_FFT_AL + ki + 1)[] = b * al_im + ob * bl_im;
+
+    ar_re = (BUF_FFT_AR + ki)[];      ar_im = (BUF_FFT_AR + ki + 1)[];
+    br_re = (BUF_FFT_BR + ki)[];      br_im = (BUF_FFT_BR + ki + 1)[];
+    (BUF_FFT_AR + ki)[]     = b * ar_re + ob * br_re;
+    (BUF_FFT_AR + ki + 1)[] = b * ar_im + ob * br_im;
+
+    k += 1;
+  );
+
+  // IFFT blended channels (fft_ipermute must follow ifft)
+  ifft(BUF_FFT_AL, FFT_N);  fft_ipermute(BUF_FFT_AL, FFT_N);
+  ifft(BUF_FFT_AR, FFT_N);  fft_ipermute(BUF_FFT_AR, FFT_N);
+
+  // Overlap-add into OLA buffers with Hann synthesis window
+  ola_pos = out_ptr;
+  k = 0;
+  loop(WIN_SIZE,
+    scale = (BUF_HANN + k)[] * ola_norm;
+    (BUF_OLA_L + ola_pos)[] += (BUF_FFT_AL + k * 2)[] * scale;
+    (BUF_OLA_R + ola_pos)[] += (BUF_FFT_AR + k * 2)[] * scale;
+    ola_pos += 1;
+    ola_pos >= WIN_SIZE ? ola_pos = 0;
+    k += 1;
+  );
+);
+
+@gfx 500 120
+
+gfx_clear = 0x141414;
+
+log_range = log(max(slider6 / max(slider5, 1.0), 1.001));
+bin_hz_g  = srate / WIN_SIZE;
+
+prev_x = -1;
+prev_y = gfx_h / 2;
+
+k = 1;
+loop(FFT_N / 2,
+  f_k = k * bin_hz_g;
+  (f_k >= slider5 && f_k <= slider6) ? (
+    x = floor(gfx_w * log(f_k / slider5) / log_range);
+    b = (BUF_BLEND + k)[];
+    y = floor(gfx_h * (1.0 - b));
+
+    b >= 0.5 ? (
+      gfx_r = 0.27; gfx_g = 0.51; gfx_b = 0.71;
+    ) : (
+      gfx_r = 0.80; gfx_g = 0.36; gfx_b = 0.27;
+    );
+    gfx_a = 0.45;
+    gfx_line(x, gfx_h / 2, x, y, 0);
+
+    prev_x >= 0 ? (
+      gfx_r = 0.85; gfx_g = 0.85; gfx_b = 0.85; gfx_a = 1.0;
+      gfx_line(prev_x, prev_y, x, y, 0);
+    );
+    prev_x = x;
+    prev_y = y;
+  );
+  k += 1;
+);
+
+// Midline at blend = 0.5
+gfx_r = 0.35; gfx_g = 0.35; gfx_b = 0.35; gfx_a = 1.0;
+gfx_line(0, gfx_h / 2, gfx_w, gfx_h / 2, 0);
+
+// Corner labels
+gfx_r = 0.55; gfx_g = 0.55; gfx_b = 0.55; gfx_a = 1.0;
+gfx_x = 3; gfx_y = 2;
+gfx_drawstr("A");
+gfx_x = 3; gfx_y = gfx_h - 12;
+gfx_drawstr("B");
